@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# volume-mixer.sh — Stateful per-app volume control
+# Usage: volume-mixer.sh [next|up|down|mute]
+# Requires: pactl (pipewire-pulse or pulseaudio), jq
+# Optional: libnotify (notify-send) for desktop popups
+set -uo pipefail
+
+command -v pactl &>/dev/null || { echo "❌  pactl not found." >&2; exit 1; }
+command -v jq    &>/dev/null || { echo "❌  jq not found (pacman -S jq)." >&2; exit 1; }
+
+STEP=5
+TIMEOUT_MS=2000
+
+# User-scoped tmpfs, cleared on logout — better fit for ephemeral UI state
+# than the shared, world-writable /tmp.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+STATE_FILE="$RUNTIME_DIR/volume-mixer-identity"
+LOCK_FILE="$RUNTIME_DIR/volume-mixer.lock"
+NOTIFY_ID_FILE="$RUNTIME_DIR/volume-mixer-notify-id"
+NOTIFY_TS_FILE="$RUNTIME_DIR/volume-mixer-notify-ts"
+
+# ── notification helper ────────────────────────────────────────────────────
+# notify TITLE BODY [ICON] [VALUE]
+# VALUE (0-150) adds a progress-bar hint that daemons like dunst/mako render
+# as a bar. Harmless no-op on daemons that ignore the hint (e.g. Plasma).
+notify() {
+ local title=$1 body=$2 icon=${3:-audio-volume-medium} value=${4:-}
+  local hint_args=()
+  if [[ -n "$value" ]]; then
+    # The progress-bar hint is conventionally 0-100, even though set_volume
+    # allows boosting actual volume up to 150%. Sending a hint above 100 has
+    # caused some notification servers to silently drop the notification
+    # entirely rather than clamp it themselves.
+    local hint_value=$value
+    (( hint_value > 100 )) && hint_value=100
+    hint_args=(-h "int:value:$hint_value")
+  fi
+
+  if ! command -v notify-send &>/dev/null; then
+    echo "$title — $body"
+    return
+  fi
+
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+  # notify-send's -r/--replace-id only works while the referenced
+  # notification is still considered "live" by the server. Reusing an ID
+  # from an already-expired notification silently drops the new one on
+  # Plasma, exactly like passing a made-up ID does. So we only attempt a
+  # replace if less time has passed than the previous notification's own
+  # timeout — otherwise we send fresh, with no -r at all.
+  local now_ms last_id last_ts replace_args=()
+  now_ms=$(date +%s%3N)
+  last_id=$(cat "$NOTIFY_ID_FILE" 2>/dev/null || echo "")
+  last_ts=$(cat "$NOTIFY_TS_FILE" 2>/dev/null || echo 0)
+  [[ "$last_ts" =~ ^[0-9]+$ ]] || last_ts=0
+
+  if [[ -n "$last_id" ]] && (( now_ms - last_ts < TIMEOUT_MS )); then
+    replace_args=(-r "$last_id")
+  fi
+
+  local new_id
+  new_id=$(notify-send -p -t "$TIMEOUT_MS" -i "$icon" "${hint_args[@]}" "${replace_args[@]}" "$title" "$body")
+
+  printf '%s' "$new_id" > "$NOTIFY_ID_FILE"
+  printf '%s' "$now_ms"  > "$NOTIFY_TS_FILE"
+}
+
+# Pick an icon name based on volume level / mute state
+icon_for() {
+  local pct=$1 muted=$2
+  if [[ "$muted" == "true" ]]; then
+    echo "audio-volume-muted"
+  elif (( pct <= 0 )); then
+    echo "audio-volume-muted"
+  elif (( pct < 34 )); then
+    echo "audio-volume-low"
+  elif (( pct < 67 )); then
+    echo "audio-volume-medium"
+  else
+    echo "audio-volume-high"
+  fi
+}
+
+# ── build entry list: "type|id|name" ───────────────────────────────────────
+get_entries() {
+  local sink
+  sink=$(pactl get-default-sink 2>/dev/null || true)
+  [[ -n "$sink" ]] && printf 'sink|%s|System\n' "$sink"
+
+  pactl -f json list sink-inputs 2>/dev/null | jq -r '
+    .[] |
+    ( .properties["application.name"] // .properties["app.name"] // .name // "App" ) as $app |
+    "input|\(.index)|\($app)"
+  '
+}
+
+# ── read / write state ─────────────────────────────────────────────────────
+# We persist an IDENTITY ("type|name"), not a raw index. The entry list is
+# rebuilt from scratch on every run, so a bare numeric index can silently
+# point at a different app once windows open/close. Re-finding by identity
+# keeps "next" pointing at what you actually last selected, when possible.
+read_identity()  { cat "$STATE_FILE" 2>/dev/null || echo ""; }
+write_identity() { printf '%s' "$1" > "$STATE_FILE"; }
+
+find_index_by_identity() {
+  local identity=$1 i=0
+  for entry in "${ENTRIES[@]}"; do
+    IFS='|' read -r t _ name <<< "$entry"
+    if [[ "$t|$name" == "$identity" ]]; then
+      echo "$i"
+      return 0
+    fi
+    (( i++ ))
+  done
+  echo -1
+}
+
+# ── volume / mute helpers ──────────────────────────────────────────────────
+get_volume() {
+  local type=$1 id=$2
+  if [[ "$type" == "sink" ]]; then
+    pactl -f json list sinks 2>/dev/null | jq -r --arg name "$id" '
+      .[] | select(.name==$name) | ([.volume[].value_percent][0] // "0%")' | tr -d '%'
+  else
+    pactl -f json list sink-inputs 2>/dev/null | jq -r --argjson idx "$id" '
+      .[] | select(.index==$idx) | ([.volume[].value_percent][0] // "0%")' | tr -d '%'
+  fi
+}
+
+get_mute() {
+  local type=$1 id=$2
+  if [[ "$type" == "sink" ]]; then
+    pactl -f json list sinks 2>/dev/null | jq -r --arg name "$id" '.[] | select(.name==$name) | .mute'
+  else
+    pactl -f json list sink-inputs 2>/dev/null | jq -r --argjson idx "$id" '.[] | select(.index==$idx) | .mute'
+  fi
+}
+
+set_volume() {
+  local type=$1 id=$2 pct=$3
+  (( pct <   0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  if [[ "$type" == "sink" ]]; then
+    pactl -- set-sink-volume       "$id" "${pct}%"
+  else
+    pactl -- set-sink-input-volume "$id" "${pct}%"
+  fi
+}
+
+toggle_mute() {
+  local type=$1 id=$2
+  if [[ "$type" == "sink" ]]; then
+    pactl set-sink-mute       "$id" toggle
+  else
+    pactl set-sink-input-mute "$id" toggle
+  fi
+}
+
+# ── main ────────────────────────────────────────────────────────────────────
+CMD="${1:-next}"
+
+# Serialize concurrent invocations (rapid key-repeat, scroll-wheel binds, etc.)
+# so two runs can't race on reading/writing the state file.
+exec 200>"$LOCK_FILE"
+flock 200
+
+mapfile -t ENTRIES < <(get_entries)
+COUNT=${#ENTRIES[@]}
+[[ $COUNT -eq 0 ]] && { notify "Volume Mixer" "No audio targets found." "dialog-error"; exit 1; }
+
+IDENTITY=$(read_identity)
+IDX=$(find_index_by_identity "$IDENTITY")
+[[ "$IDX" -lt 0 ]] && IDX=0
+
+IFS='|' read -r TYPE ID NAME <<< "${ENTRIES[$IDX]}"
+
+case "$CMD" in
+  next)
+    IDX=$(( (IDX + 1) % COUNT ))
+    IFS='|' read -r TYPE ID NAME <<< "${ENTRIES[$IDX]}"
+    write_identity "${TYPE}|${NAME}"
+    VOL=$(get_volume "$TYPE" "$ID")
+    MUTED=$(get_mute "$TYPE" "$ID")
+    ICON=$(icon_for "$VOL" "$MUTED")
+    busctl --user call org.kde.plasmashell /org/kde/osdService org.kde.osdService mediaPlayerVolumeChanged iss "$VOL" "${NAME}" "audio-volume-high"
+    #notify "Volume Mixer" "Now controlling: ${NAME} (${VOL}%)" "$ICON" "$VOL"
+    ;;
+  up)
+    write_identity "${TYPE}|${NAME}"
+    VOL=$(get_volume "$TYPE" "$ID")
+    set_volume "$TYPE" "$ID" $(( VOL + STEP ))
+    VOL=$(get_volume "$TYPE" "$ID")
+    MUTED=$(get_mute "$TYPE" "$ID")
+    ICON=$(icon_for "$VOL" "$MUTED")
+    busctl --user call org.kde.plasmashell /org/kde/osdService org.kde.osdService mediaPlayerVolumeChanged iss "$VOL" "${NAME}" "audio-volume-high"
+    #notify "$NAME" "${VOL}%" "$ICON" "$VOL"
+    ;;
+  down)
+    write_identity "${TYPE}|${NAME}"
+    VOL=$(get_volume "$TYPE" "$ID")
+    set_volume "$TYPE" "$ID" $(( VOL - STEP ))
+    VOL=$(get_volume "$TYPE" "$ID")
+    MUTED=$(get_mute "$TYPE" "$ID")
+    ICON=$(icon_for "$VOL" "$MUTED")
+    busctl --user call org.kde.plasmashell /org/kde/osdService org.kde.osdService mediaPlayerVolumeChanged iss "$VOL" "${NAME}" "audio-volume-high"
+    #notify "$NAME" "${VOL}%" "$ICON" "$VOL"
+    ;;
+  mute)
+    write_identity "${TYPE}|${NAME}"
+    toggle_mute "$TYPE" "$ID"
+    VOL=$(get_volume "$TYPE" "$ID")
+    MUTED=$(get_mute "$TYPE" "$ID")
+    ICON=$(icon_for "$VOL" "$MUTED")
+    if [[ "$MUTED" == "true" ]]; then
+      notify "$NAME" "Muted" "$ICON"
+    else
+      notify "$NAME" "${VOL}%" "$ICON" "$VOL"
+    fi
+    ;;
+  *)
+    echo "Usage: $(basename "$0") [next|up|down|mute]" >&2
+    exit 1
+    ;;
+esac
